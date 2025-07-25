@@ -16,6 +16,7 @@ using MCGalaxy.Network;
 using System.Linq;
 using System.Xml.Serialization;
 using MCGalaxy.Blocks;
+using MCGalaxy.Commands;
 
 namespace MCGalaxy
 {
@@ -37,7 +38,7 @@ namespace MCGalaxy
 
         private SchedulerTask _task;
         private readonly Level _level;
-        private Scheduler instance;
+        private static Scheduler instance;
 
         private readonly object activateLock = new object();
         private readonly object deactivateLock = new object();
@@ -51,21 +52,23 @@ namespace MCGalaxy
         {
             lock (activateLock)
             {
-                if (instance != null) return;
-                instance = new Scheduler(String.Format("AnimationsScheduler+{0}", _level.name));
+                //Lazy initialisation of the singular instance of our task Scheduler
+                if (instance == null) instance = new Scheduler(String.Format("AnimationsScheduler+{0}", _level.name));
+
+                if (_task != null) return; //Prevent unintentional multiple activations of the same level
+                buffer = new BufferedBlockSender(_level);
+                _task = instance.QueueRepeat(AnimationHandler.Update, _level, TimeSpan.FromMilliseconds(DEFAULT_SPEED));
             }
-
-            buffer = new BufferedBlockSender(_level);
-
-            _task = instance.QueueRepeat(AnimationHandler.Update, _level, TimeSpan.FromMilliseconds(DEFAULT_SPEED));
         }
         public void Deactivate()
         {
             lock (deactivateLock)
             {
-                if (instance != null)
+                //Prevent unintentional multiple deactivations of the same level
+                if (_task != null)
                 {
                     instance.Cancel(_task);
+                    _task = null;
                 }
             }
             buffer = new BufferedBlockSender();
@@ -241,6 +244,8 @@ namespace MCGalaxy
 
         private void HandlePlayerClick(Player p, MouseButton button, MouseAction action, ushort yaw, ushort pitch, byte entity, ushort x, ushort y, ushort z, TargetBlockFace face)
         {
+            if (!p.level.Config.Deletable) return;
+
             AnimationHandler.SendCurrentFrameBlock(p, x, y, z);
         }
 
@@ -758,23 +763,29 @@ namespace MCGalaxy
         // Gets the currently visible block for a single loop. Returns 65535 if the loop is "off" in a frame
         private static BlockID CurrentBlock(AnimLoop loop, ushort tick)
         {
+
             if (tick < loop._startTick)
             {
                 return System.UInt16.MaxValue;
             }
 
-            if (tick > loop._endTick)
-            {
-                if (((loop._endTick - loop._startTick) % loop._interval) < loop._duration)       // If the block is active during the loop
+            try {
+                if (tick > loop._endTick)
+                {
+                    if (((loop._endTick - loop._startTick) % loop._interval) < loop._duration)       // If the block is active during the loop
+                    {
+                        return loop._block;
+                    }
+                    return System.UInt16.MaxValue;
+                }
+
+                if (((tick - loop._startTick) % loop._interval) < loop._duration)       // If the block is active during the loop
                 {
                     return loop._block;
                 }
+            } catch (System.DivideByZeroException e) {
+                // No more error log spam please - goodly
                 return System.UInt16.MaxValue;
-            }
-
-            if (((tick - loop._startTick) % loop._interval) < loop._duration)       // If the block is active during the loop
-            {
-                return loop._block;
             }
 
             return System.UInt16.MaxValue;
@@ -973,9 +984,20 @@ namespace MCGalaxy
         public override string type { get { return CommandTypes.Other; } }
         public override LevelPermission defaultRank { get { return LevelPermission.Guest; } }
 
+        public override CommandPerm[] ExtraPerms {
+            get { return new[] { new CommandPerm(LevelPermission.Guest, "can bypass the realm owner permission check") }; }
+        }
+
         public override void Use(Player p, string message)
         {
-            if (!p.level.BuildAccess.CheckAllowed(p))
+            //Cache level so that the player cannot switch levels after the permission check has ran but before the cmd runs
+            Level level = p.level;
+
+            if (!(HasExtraPerm(p, p.Rank, 1) || LevelInfo.IsRealmOwner(p.name, level.name))) {
+                p.Message("You can only use &T/{0} &Sif you are the map owner.", name);
+                return;
+            }
+            if (!level.BuildAccess.CheckAllowed(p))
             {
                 p.Message("You do not have permissions to use animations on this level.");
                 return;
@@ -1043,9 +1065,9 @@ namespace MCGalaxy
             args = (args.Where(s => !(zSynms.Contains(s) || appSynms.Contains(s) || prepSynms.Contains(s)))).ToList().ToArray();   // Keep only the non-cuboid, non-append/prepend related args
 
             // Add the map animation if it doesn't exist
-            if (!AnimationHandler.HasAnims(p.level))
+            if (!AnimationHandler.HasAnims(level))
             {
-                AnimationHandler.ConditionalAddMapAnimation(p.level);
+                AnimationHandler.ConditionalAddMapAnimation(level);
             }
 
             /* COMMAND SWITCH */
@@ -1054,21 +1076,21 @@ namespace MCGalaxy
                 case 1: // "/anim stop", "/anim start", "/anim delete", "/anim save", "/anim restart", "/anim info", "/anim copy", "/anim paste", "/anim reverse", "/anim cut", "/anim backup", "/anim killer" (and just "/anim" is also considered length 1)
                     if (args[0] == "stop")          // "/anim stop"
                     {
-                        StopAnim(p.level);
+                        StopAnim(level);
                         p.Message("Stopped animation");
-                        AnimationHandler.SendCurrentFrame(p.level);
+                        AnimationHandler.SendCurrentFrame(level);
                     }
                     else if (args[0] == "start")    // "/anim start"
                     {
-                        StartAnim(p.level);
+                        StartAnim(level);
                         p.Message("Started animation");
-                        AnimationHandler.SendCurrentFrame(p.level);
+                        AnimationHandler.SendCurrentFrame(level);
                     }
                     else if (args[0] == "save")     // "/anim save"
                     {
-                        AnimationsPlugin.SaveAnimation(p.level);
-                        AnimationsPlugin.SaveConfig(p.level);
-                        p.level.Message("Saved animations");
+                        AnimationsPlugin.SaveAnimation(level);
+                        AnimationsPlugin.SaveConfig(level);
+                        level.Message("Saved animations");
                     }
                     else if (args[0] == "delete")   // "/anim delete"
                     {
@@ -1090,8 +1112,8 @@ namespace MCGalaxy
                     {
                         p.Message("Restarted animation");
 
-                        AnimationHandler.dictActiveLevels[p.level.name]._currentTick = 1;
-                        AnimationHandler.SendCurrentFrame(p.level);
+                        AnimationHandler.dictActiveLevels[level.name]._currentTick = 1;
+                        AnimationHandler.SendCurrentFrame(level);
                     }
                     else if (args[0] == "copy")       // "/anim copy"
                     {
@@ -1124,19 +1146,19 @@ namespace MCGalaxy
                     }
                     else if (args[0] == "backup")     // "/anim backup"
                     {
-                        AnimationsPlugin.SaveAnimationBackup(p.level);
+                        AnimationsPlugin.SaveAnimationBackup(level);
                         p.Message("Created backup");
                     }
                     else if (args[0] == "killer")       // "/anim killer"
                     {
-                        if (AnimationHandler.dictActiveLevels[p.level.name].bKiller)
+                        if (AnimationHandler.dictActiveLevels[level.name].bKiller)
                         {
-                            AnimationHandler.dictActiveLevels[p.level.name].bKiller = false;
+                            AnimationHandler.dictActiveLevels[level.name].bKiller = false;
                             p.Message("Killer blockprops are off for animations");
                         }
                         else
                         {
-                            AnimationHandler.dictActiveLevels[p.level.name].bKiller = true;
+                            AnimationHandler.dictActiveLevels[level.name].bKiller = true;
                             p.Message("Killer blockprops are on for animations");
                         }
                     }
@@ -1185,8 +1207,8 @@ namespace MCGalaxy
                     {
                         p.Message(String.Format("Set tick to {0}", tick.ToString()));
 
-                        AnimationHandler.dictActiveLevels[p.level.name]._currentTick = tick;
-                        AnimationHandler.SendCurrentFrame(p.level);
+                        AnimationHandler.dictActiveLevels[level.name]._currentTick = tick;
+                        AnimationHandler.SendCurrentFrame(level);
                     }
                     else if (args[0] == "paste" && short.TryParse(args[1], out delay))    // "/anim paste [delay]"
                     {
@@ -1208,7 +1230,7 @@ namespace MCGalaxy
                     }
                     else if (args[0] == "speed" && ushort.TryParse(args[1], out num))     // "/anim speed [ms]"
                     {
-                        if (!AnimationHandler.HasAnims(p.level)) { return; }
+                        if (!AnimationHandler.HasAnims(level)) { return; }
 
                         if (num < 50)
                         {
@@ -1216,18 +1238,18 @@ namespace MCGalaxy
                             return;
                         }
 
-                        AnimationHandler.dictActiveLevels[p.level.name].SetSpeed(num);
+                        AnimationHandler.dictActiveLevels[level.name].SetSpeed(num);
                         p.Message(String.Format("Speed changed to {0}", num.ToString()));
                     }
                     else if (args[0] == "remove" && args[1] == "all")         // "/anim remove all"
                     {
-                        AnimationHandler.dictActiveLevels[p.level.name]._blocks = new List<AnimBlock>();
-                        AnimationHandler.SendCurrentFrame(p.level);
+                        AnimationHandler.dictActiveLevels[level.name]._blocks = new List<AnimBlock>();
+                        AnimationHandler.SendCurrentFrame(level);
 
-                        AnimationsPlugin.ConditionalDeleteAnimationFile(p.level.name);
-                        AnimationsPlugin.ConditionalDeleteAnimationConfigFile(p.level.name);
+                        AnimationsPlugin.ConditionalDeleteAnimationFile(level.name);
+                        AnimationsPlugin.ConditionalDeleteAnimationConfigFile(level.name);
 
-                        AnimationHandler.RemoveFromActiveLevels(p.level);
+                        AnimationHandler.RemoveFromActiveLevels(level);
                     }
                     else
                     {
@@ -1383,7 +1405,7 @@ namespace MCGalaxy
                 p.Message("You do not have permissions to use animations on this level.");
                 return true;
             }
-        
+
             ushort x = (ushort)marks[0].X, y = (ushort)marks[0].Y, z = (ushort)marks[0].Z;
             ushort x2 = 0, y2 = 0, z2 = 0;
             if (marks.Length > 1)
